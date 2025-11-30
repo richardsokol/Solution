@@ -18,6 +18,7 @@ from camera import CameraStream
 from detector import ObjectDetector
 from light_controller import create_light_controller
 from video_processor import VideoProcessor
+from get_youtube_stream import get_youtube_stream_url
 
 # Configure logging
 logging.basicConfig(
@@ -80,6 +81,17 @@ class MessageResponse(BaseModel):
     """Standard message response"""
     message: str
     success: bool = True
+
+
+class CameraSwitchRequest(BaseModel):
+    """Model for camera switch request"""
+    camera_id: str
+
+
+class YouTubeStreamRequest(BaseModel):
+    """Model for YouTube stream URL extraction"""
+    camera_id: str
+    youtube_url: str
 
 
 # Startup event
@@ -387,6 +399,196 @@ async def reset_stats():
     
     video_processor.reset_stats()
     return MessageResponse(message="Statistics reset")
+
+
+@app.get("/camera/list")
+async def list_cameras():
+    """List all available camera sources"""
+    if 'sources' not in config['camera']:
+        return {
+            "message": "No multiple camera sources configured",
+            "current_source": config['camera'].get('source', 'Unknown')
+        }
+    
+    sources = config['camera']['sources']
+    current_source = config['camera'].get('source', '')
+    
+    camera_list = []
+    for camera_id, camera_info in sources.items():
+        camera_list.append({
+            "id": camera_id,
+            "name": camera_info.get('name', camera_id),
+            "url": camera_info.get('url', ''),
+            "type": camera_info.get('type', 'standard'),
+            "is_active": camera_info.get('url') == current_source
+        })
+    
+    return {
+        "cameras": camera_list,
+        "total": len(camera_list)
+    }
+
+
+@app.post("/camera/switch")
+async def switch_camera(request: CameraSwitchRequest):
+    """Switch to a different camera source"""
+    global config, camera, video_processor
+    
+    # Check if multiple sources are configured
+    if 'sources' not in config['camera']:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple camera sources not configured in config.yaml"
+        )
+    
+    # Validate camera ID
+    camera_id = request.camera_id
+    if camera_id not in config['camera']['sources']:
+        available = list(config['camera']['sources'].keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_id}' not found. Available: {available}"
+        )
+    
+    # Get camera configuration
+    camera_source_config = config['camera']['sources'][camera_id]
+    camera_name = camera_source_config.get('name', camera_id)
+    
+    try:
+        # Stop video processing if running
+        was_running = False
+        if video_processor and video_processor.is_running:
+            was_running = True
+            video_processor.stop()
+            logger.info("Stopped video processor for camera switch")
+        
+        # Disconnect old camera
+        if camera:
+            camera.disconnect()
+            logger.info("Disconnected old camera")
+        
+        # Update config with the selected camera's full configuration
+        new_camera_config = config['camera'].copy()
+        
+        # Merge camera source config into main camera config
+        for key, value in camera_source_config.items():
+            if key != 'name':  # Don't override config keys with 'name'
+                new_camera_config[key] = value
+        
+        # Keep FPS and resolution from main config if not specified
+        new_camera_config['fps'] = config['camera'].get('fps', 30)
+        new_camera_config['resolution'] = config['camera'].get('resolution', {'width': 640, 'height': 480})
+        
+        # Initialize new camera with merged config
+        camera = CameraStream(new_camera_config)
+        if not camera.connect():
+            raise Exception("Failed to connect to new camera source")
+        
+        logger.info(f"Connected to new camera: {camera_name}")
+        
+        # Update main config
+        config['camera']['source'] = camera_source_config.get('url', camera_source_config)
+        
+        # Update video processor with new camera
+        if video_processor:
+            video_processor.camera = camera
+        
+        # Restart video processing if it was running
+        if was_running and video_processor:
+            video_processor.start()
+            logger.info("Restarted video processor with new camera")
+        
+        return {
+            "message": f"Successfully switched to camera: {camera_name}",
+            "camera_id": camera_id,
+            "camera_name": camera_name,
+            "camera_type": camera_source_config.get('type', 'standard'),
+            "processing_resumed": was_running
+        }
+    
+    except Exception as e:
+        logger.error(f"Error switching camera: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to switch camera: {str(e)}")
+
+
+@app.post("/camera/set-stream")
+async def set_custom_stream(request: YouTubeStreamRequest):
+    """
+    Extract stream URL from YouTube or set custom RTSP/stream URL for specified camera
+    
+    Args:
+        camera_id: ID of camera to update (e.g., 'camera1', 'camera2', 'real_camera')
+        youtube_url: YouTube video/livestream URL or RTSP URL (e.g., rtsp://camera.openlab...)
+    
+    Returns:
+        Success message with extracted stream URL
+    """
+    global config, camera, video_processor
+    
+    # Check if multiple sources are configured
+    if 'sources' not in config['camera']:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple camera sources not configured in config.yaml"
+        )
+    
+    # Validate camera ID
+    camera_id = request.camera_id
+    if camera_id not in config['camera']['sources']:
+        available = list(config['camera']['sources'].keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera '{camera_id}' not found. Available: {available}"
+        )
+    
+    try:
+        # Check if it's an RTSP URL or YouTube URL
+        input_url = request.youtube_url.strip()
+        
+        if input_url.startswith('rtsp://') or (input_url.startswith('http') and 'youtube' not in input_url.lower()):
+            # Direct stream URL (RTSP, HTTP, etc.)
+            stream_url = input_url
+            logger.info(f"Using direct stream URL: {stream_url}")
+        else:
+            # YouTube URL - extract stream
+            logger.info(f"Extracting stream URL from YouTube: {request.youtube_url}")
+            stream_url = get_youtube_stream_url(request.youtube_url)
+            
+            if not stream_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Failed to extract stream URL from YouTube. Please check the URL."
+                )
+        
+        # Update config in memory
+        config['camera']['sources'][camera_id]['url'] = stream_url
+        
+        # Save to config.yaml file
+        config_path = Path("config.yaml")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+        
+        logger.info(f"Updated {camera_id} with new stream URL")
+        
+        stream_type = "RTSP" if stream_url.startswith('rtsp://') else "Stream"
+        return {
+            "message": f"Successfully updated {camera_id} with {stream_type}",
+            "camera_id": camera_id,
+            "camera_name": config['camera']['sources'][camera_id].get('name', camera_id),
+            "input_url": request.youtube_url,
+            "stream_url": stream_url[:100] + "..." if len(stream_url) > 100 else stream_url,
+            "stream_type": stream_type,
+            "note": "Use 'Camera Source' dropdown to switch to this camera"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting YouTube stream: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract YouTube stream: {str(e)}"
+        )
 
 
 @app.get("/health")
